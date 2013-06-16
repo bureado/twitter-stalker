@@ -14,30 +14,12 @@
 # The program will add a Twitter follower object to a small schema with the
 # name of the tweetstar, and to a large schema named 'people'.
 
-# IMPORTANT: you need to request a consumer key/secret and access token+secret
-# from Twitter to access their API. Fill out the data below. Module won't work
-# otherwise. You also need MongoDB running.
-
-# Performance notes: slurping data from Twitter is resource-consuming, both in
-# bandwidth, CPU in some cycles, RAM and I/O when writting to Mongo. I run one
-# Twitter analysis for Ecuador each Q, and consume about 150 MB of res MEM with
-# Mongo, and varying levels of CPU and MEM with this Perl script. My learnings:
-#
-#   1. Adjust near line 110, if you want to write earlier or later. Writing later
-#      exhausts MongoDB RAM more slowly, but then Perl will consume a bit more.
-#   2. Consider trying to connect to MongoDB on the write loops. I haven't tried
-#      this but it seems that keeping the connection open will cause overhead in
-#      large Twitter accounts.
-#   3. Adjust the sleep rate near line 128, if you want a more smooth execution or
-#      just exhaust your rate ASAP.
-#   4. Avoid querying Mongo while the process is running, especialy when your
-#      tables don't have indices. It hogs RAM like a boss.
-
 package Stalker;
 
 use MongoDB;
 use Net::Twitter;
 use POSIX qw/strftime/;
+use Date::Parse;
 
 sub new {
 	my $package   = shift;
@@ -50,7 +32,7 @@ sub new {
 sub connect {
 	my $nt = Net::Twitter->new(
 	 # YOU NEED TO CONFIGURE THE VALUES BELOW.
-         traits              => [qw/API::REST OAuth RateLimit/],
+         traits              => [qw/OAuth API::RESTv1_1/],
 	 consumer_key        => '',
 	 consumer_secret     => '',
 	 access_token        => '',
@@ -70,13 +52,16 @@ sub populateStarFollowers {
 	my $conn = MongoDB::Connection->new; # This will connect to Mongo in localhost.
                                              # See CPAN MongoDB docs for other scenarios.
 
-	my $dbh   = $conn->twitter; # DB name in MongoDB
-	my $ppl   = $dbh->people;   # "Large" schema name
+	my $dbh   = $conn->get_database('twitter'); # DB name in MongoDB
+	my $ppl   = $dbh->get_collection('people');   # "Large" schema name
 
 	foreach my $twitstar ( @$twitstars ) {
 		next unless $twitstar;
-
-		my $str   = $dbh->${twitstar}; # "Small" schema name
+		if ( @$twitstars > 1 ) {
+			print "[INF] Multiple twitstars mode, resetting cursor\n";
+			$cursor = -1;
+		}
+		my $str   = $dbh->get_collection($twitstar); # "Small" schema name
 	
 		print "[INF] Entering $twitstar at " . localtime() . "\n";
 		my @objs;
@@ -84,13 +69,14 @@ sub populateStarFollowers {
 		
 		for ( my $r; $cursor; $cursor = $r->{next_cursor} ) {
 			eval {
-				print "[DBG] Entering READ loop in cursor $cursor ($i)\n";
 				$r = $nt->followers( { screen_name => $twitstar, cursor => $cursor } );
 			};
 			if ( $@ ) {
-				print "[ERR] Fail whale: $@\n"; # This happens more often than I'd like.
+				print "[ERR] Fail whale: $@\n" unless $@ =~ /Rate limit/; # This happens more often than I'd like.
+				sleep 300 if $@ =~ /Rate limit/;
 				redo;
 			}
+			print "[DBG] Entering READ loop in cursor $cursor ($i)\n";
 			my $users  = $r->{users};
 			foreach my $user ( @$users ) {
 				print "[DBG] Entering follower " . $user->{screen_name} . "\n";
@@ -98,10 +84,15 @@ sub populateStarFollowers {
 				my %obj;
 
 				# I get only the useful fields (that's why I don't copy the object)
-				my @usf = qw/screen_name user_id created_at statuses_count time_zone followers_count friends_count location lang description utc_offset/;
-				foreach ( my @usf ) {
+				my @usf = qw/screen_name id created_at statuses_count time_zone followers_count friends_count location lang description/;
+				foreach ( @usf ) {
 					$obj{$_} = $user->{$_};
 				}
+
+				$obj{'source'}      = $user->{'status'}->{'source'};
+				$obj{'coordinates'} = $user->{'status'}->{'coordinates'};
+				$obj{'place'}       = $user->{'status'}->{'place'};
+				$obj{'geo'}         = $user->{'status'}->{'geo'};
 
 				# I do some date mangling here so I can do data arithmetics later.
 				$obj{'created_at'} =~ s/^(\w)+//;
@@ -119,16 +110,16 @@ sub populateStarFollowers {
 					foreach my $act ( @objs ) {
 						my $scr = $act->{'screen_name'};
 						$ppl->insert($act) ? print "[DBG] Created $scr in MongoDB\n" : print "[DBG] Skipped $scr\n";
-						$str->insert({'user_id' => $act->{'user_id'}});
+						$str->insert({'id' => $act->{'id'}});
 					}
 					undef @objs;
 					$i = 1;
 				}
 				++$i;
 			}
-			my $slp = $nt->until_rate(0.1); # Rate limiting, Twitter-enforced.
-			print "[INF] Sleeping $slp seconds\n";
-			sleep $slp;
+			#my $slp = $nt->until_rate(0.1); # Rate limiting, Twitter-enforced.
+			#print "[INF] Sleeping $slp seconds\n";
+			#sleep $slp;
 		}
 		if ( $i > 0 ) { # Last flush.
 			print "[DBG] Entering last WRITE loop at $i in cursor $cursor\n";
